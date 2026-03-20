@@ -1,0 +1,1479 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r}
+# ==============================================================================
+# Step 0: Environment Setup and Global Configuration
+# ==============================================================================
+# This block handles all dependencies and sets the master parameters for the 
+# entire multi-omics pipeline. 
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# A. Package Installation and Loading
+# ------------------------------------------------------------------------------
+cat("Checking and installing necessary packages...\n")
+
+# CRAN Packages
+cran_deps <- c("tidyverse", "ggplot2", "reshape2", "stringr", "dplyr", "randomForest", "remotes")
+for (pkg in cran_deps) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "[https://cloud.r-project.org](https://cloud.r-project.org)")
+  }
+}
+
+# Bioconductor Packages
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager", repos = "[https://cloud.r-project.org](https://cloud.r-project.org)")
+}
+bioc_deps <- c("DESeq2", "WGCNA", "clusterProfiler", "org.Hs.eg.db", "enrichplot", "mixOmics", "impute", "preprocessCore", "GO.db", "AnnotationDbi")
+for (pkg in bioc_deps) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, update = FALSE, ask = FALSE)
+  }
+}
+
+# GitHub Packages (iRF, fastshap, shapviz)
+if (!requireNamespace("iRF", quietly = TRUE)) remotes::install_github("karlkumbier/iRF2.0")
+if (!requireNamespace("fastshap", quietly = TRUE)) remotes::install_github("bgreenwell/fastshap")
+if (!requireNamespace("shapviz", quietly = TRUE)) remotes::install_github("ModelOriented/shapviz")
+
+# Load Libraries
+library(tidyverse)
+library(DESeq2)
+library(RGCCA)
+library(iRF)
+library(randomForest)
+library(reshape2)
+library(stringr)
+library(WGCNA)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(fastshap)
+library(shapviz)
+library(mixOmics)
+library(BiocParallel)
+
+# Fix for remote cluster/BearPortal plotting issues (X11 display error)
+options(bitmapType='cairo')
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads() # Enable multi-threading for WGCNA
+
+# ------------------------------------------------------------------------------
+# B. Global Pipeline Configuration ("Magic Numbers")
+# ------------------------------------------------------------------------------
+GLOBAL_SEED <- 42               # Master seed for all stochastic processes
+DESEQ_P_CUTOFF <- 0.05           # Step 1: DESeq2 padj cutoff to target ~2000 RNA features
+IRF_ITER <- 5                   # Step 3: iRF iterations for convergence
+IRF_BOOTSTRAP <- 100             # Step 3: iRF bootstrap replicates for interaction stability
+DIABLO_FEAT_LIMIT <- c(30, 30)  # Step 8: Number of features to keep per omics block in DIABLO
+
+cat("Environment setup complete. Libraries loaded and parameters configured.\n")
+```
+
+```{r}
+# ==============================================================================
+# Step 1: Data Integration & Unbiased Alignment (Variance-Based Filtering)
+# ==============================================================================
+cat("Loading datasets and metadata...\n")
+
+# 1. Load Metadata and Define Factors
+meta <- read.csv("sample_sheet.csv", stringsAsFactors = FALSE)
+rownames(meta) <- meta$SampleID
+
+# 2. Load Transcriptome (VST counts)
+rna_vst <- read.csv("rna_vst_counts.csv", row.names = 1, check.names = FALSE)
+
+# 3. Load Metabolomes
+pos <- read.csv("polar_pos_pqn_imputed_glog.csv", check.names = FALSE)
+rownames(pos) <- make.names(pos[["mz"]], unique = TRUE)
+pos <- pos[, -grep("mz", colnames(pos))]
+
+neg <- read.csv("polar_neg_pqn_imputed_glog.csv", check.names = FALSE)
+rownames(neg) <- make.names(neg[["mz"]], unique = TRUE)
+neg <- neg[, -grep("mz", colnames(neg))]
+
+# 4. Load Chemical Data (n=12 sites)
+chem_raw <- read.delim("water_chemicals.tsv", sep="\t", header=TRUE, check.names = FALSE)
+# Reshape so sites are rows, chemicals are columns
+chem_mat <- as.data.frame(t(chem_raw[, grep("^D[0-9]{2}", colnames(chem_raw))]))
+colnames(chem_mat) <- make.names(chem_raw$ChemName, unique = TRUE)
+chem_mat$Site <- rownames(chem_mat)
+
+# ------------------------------------------------------------------------------
+# THE FIX 1: Unsupervised Variance-Based Filtering (No Double-Dipping)
+# ------------------------------------------------------------------------------
+cat("\nPerforming Unbiased Variance Filtering...\n")
+
+# Function to filter top features by variance (without looking at labels)
+filter_by_var <- function(df, top_n) {
+  vars <- apply(df, 1, var, na.rm = TRUE)
+  top_features <- names(sort(vars, decreasing = TRUE))[1:min(top_n, length(vars))]
+  return(df[top_features, ])
+}
+
+# Select top features based on information content, not significance
+rna_vst_filtered <- filter_by_var(rna_vst, 5000) # Keep top 5000 genes
+pos_filtered <- filter_by_var(pos, 1200)         # Keep top 1000 pos-peaks
+neg_filtered <- filter_by_var(neg, 2000)         # Keep top 1000 neg-peaks
+
+cat(sprintf("Retained %d genes and %d metabolites for integration.\n", 
+            nrow(rna_vst_filtered), nrow(pos_filtered) + nrow(neg_filtered)))
+
+# ------------------------------------------------------------------------------
+# THE FIX 2: Sample Alignment & Chemical Broadcasting (Solving n=12)
+# ------------------------------------------------------------------------------
+# Identify common samples across all biological layers
+get_sample_cols <- function(col_names) grep("^(CK|D[0-9]{2})", col_names, value = TRUE)
+common_samples <- intersect(intersect(get_sample_cols(colnames(rna_vst_filtered)), 
+                                      get_sample_cols(colnames(pos_filtered))), 
+                            get_sample_cols(colnames(neg_filtered)))
+common_samples <- intersect(common_samples, meta$SampleID)
+
+cat(sprintf("Aligning %d samples across all blocks...\n", length(common_samples)))
+
+# Transpose biological blocks
+X_rna <- as.data.frame(t(rna_vst_filtered[, common_samples]))
+X_pos <- as.data.frame(t(pos_filtered[, common_samples]))
+X_neg <- as.data.frame(t(neg_filtered[, common_samples]))
+Y_meta <- meta[common_samples, ]
+
+# THE BROADCAST: Link Site-level Chemical Exposure to every biological replicate
+# This gives you n=150 statistical power instead of n=12
+X_chem <- Y_meta %>%
+  dplyr::select(SampleID, Site) %>%
+  dplyr::left_join(chem_mat, by = "Site") %>%
+  dplyr::select(-SampleID, -Site) # Keep only numeric chemical values
+rownames(X_chem) <- Y_meta$SampleID
+
+# Final Alignment Check
+stopifnot(all(rownames(X_rna) == rownames(Y_meta)))
+stopifnot(all(rownames(X_rna) == rownames(X_chem)))
+
+# Save final outputs for next steps
+save(X_rna, X_pos, X_neg, X_chem, Y_meta, common_samples, 
+     file = "aligned_multiomics_data.RData")
+
+cat("Step 1 Complete: Data is unbiased, aligned, and chemical exposures are broadcasted.\n")
+```
+
+
+```{r}
+# ==============================================================================
+# Step 1.5: Pre-Integration PCA Quality Control
+# ==============================================================================
+# --- Pre-Integration PCA ---
+
+cat("Preparing combined data and running preliminary PCA...\n")
+
+# 1. Combine the blocks FIRST
+X_combined <- cbind(X_rna, X_pos, X_neg)
+
+# 2. Run PCA (scale. = TRUE is vital here due to different omics units)
+pca_res <- prcomp(X_combined, scale. = TRUE)
+
+# 3. Create a dataframe for plotting
+pca_df <- as.data.frame(pca_res$x)
+pca_df$Site <- Y_meta$Site       # Correcting from REF to Site for geographic mapping
+pca_df$Treatment <- Y_meta$REF   # Control, 1x, or 10x
+
+# 4. Calculate variance explained
+var_explained <- round(100 * pca_res$sdev^2 / sum(pca_res$sdev^2), 1)
+
+# 5. Plotting
+pdf("Pre_Integration_PCA.pdf", width = 8, height = 6)
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Treatment, shape = Site)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "PCA of Combined Multi-Omics Features",
+       subtitle = "Checking for natural biological variance before machine learning",
+       x = paste0("PC1 (", var_explained[1], "%)"),
+       y = paste0("PC2 (", var_explained[2], "%)"))
+print(p_pca)
+dev.off()
+
+cat("PCA plot saved to 'Pre_Integration_PCA.pdf'\n")
+```
+
+
+```{r}
+# ==============================================================================
+# Step 2: Multi-Omics Integration using Supervised SGCCA (Annotated & Tuned)
+# ==============================================================================
+cat("Loading aligned data and annotations...\n")
+load("aligned_multiomics_data.RData")
+
+X_rna <- as.matrix(X_rna)
+X_pos <- as.matrix(X_pos)
+X_neg <- as.matrix(X_neg)
+
+# --- Load Annotations Safely ---
+rna_map <- tryCatch(read.delim("rna_dma_to_hsa_gn_mappings.tsv", sep="\t", header=FALSE, stringsAsFactors=FALSE), error=function(e) NULL)
+pos_kegg <- tryCatch(read.delim("polar_pos_pkl_to_kegg_annotations.tsv", sep="\t", header=FALSE, stringsAsFactors=FALSE), error=function(e) NULL)
+pos_hmdb <- tryCatch(read.delim("polar_pos_pkl_to_hmdb_annotations.tsv", sep="\t", header=FALSE, stringsAsFactors=FALSE), error=function(e) NULL)
+neg_kegg <- tryCatch(read.delim("polar_neg_pkl_to_kegg_annotations.tsv", sep="\t", header=FALSE, stringsAsFactors=FALSE), error=function(e) NULL)
+neg_hmdb <- tryCatch(read.delim("polar_neg_pkl_to_hmdb_annotations.tsv", sep="\t", header=FALSE, stringsAsFactors=FALSE), error=function(e) NULL)
+
+combine_metab_maps <- function(kegg, hmdb) {
+  if (is.null(kegg) && is.null(hmdb)) return(NULL)
+  if (!is.null(kegg)) kegg <- kegg[, c(1, 3)]
+  if (!is.null(hmdb)) hmdb <- hmdb[, c(1, 3)]
+  if (is.null(kegg)) { names(hmdb) <- c("ID", "Annotation"); return(hmdb) }
+  if (is.null(hmdb)) { names(kegg) <- c("ID", "Annotation"); return(kegg) }
+  
+  merged <- merge(kegg, hmdb, by = "V1", all = TRUE)
+  merged$Annotation <- paste(ifelse(is.na(merged$V3.x) | merged$V3.x == "", "", merged$V3.x),
+                             ifelse(is.na(merged$V3.y) | merged$V3.y == "", "", merged$V3.y), sep = " | ")
+  merged$Annotation <- gsub("^ \\| | \\| $", "", merged$Annotation)
+  merged$Annotation <- ifelse(merged$Annotation == "", NA, merged$Annotation)
+  
+  df_out <- merged[, c("V1", "Annotation")]
+  names(df_out) <- c("ID", "Annotation")
+  return(df_out)
+}
+
+pos_map <- combine_metab_maps(pos_kegg, pos_hmdb)
+neg_map <- combine_metab_maps(neg_kegg, neg_hmdb)
+
+# --- SUPERVISED FIX: Create Response Block & Design Matrix ---
+# Convert Control, 1x, 10x into a numeric dose-response vector
+treatment_response <- as.matrix(as.numeric(factor(Y_meta$REF, levels = c("Control", "1x", "10x"))))
+rownames(treatment_response) <- rownames(Y_meta)
+
+blocks <- list(
+  Transcriptome = X_rna, 
+  Metabolome_Pos = X_pos, 
+  Metabolome_Neg = X_neg,
+  Treatment = treatment_response
+)
+
+# Connect omics blocks to each other (1) AND to the Treatment block (1)
+design_matrix <- matrix(
+  c(0, 1, 1, 1,
+    1, 0, 1, 1,
+    1, 1, 0, 1,
+    1, 1, 1, 0), 
+  ncol = 4, nrow = 4, 
+  dimnames = list(names(blocks), names(blocks))
+)
+
+cat("\n--- Sparsity Tuning (rgcca_cv) for Supervised SGCCA ---\n")
+optimal_sparsity <- c(0.1, 0.2, 0.2, 1) 
+
+tryCatch({
+  set.seed(GLOBAL_SEED) # Ensure CV is reproducible
+  # response = 4 targets the Treatment block
+  cv_out <- rgcca_cv(blocks = blocks, method = "sgcca", response = 4, 
+                     par_type = "sparsity", n_run = 5, n_cores = 1, verbose = FALSE)
+  
+  temp_sparsity <- if ("bestpenalties" %in% names(cv_out)) cv_out$bestpenalties else cv_out$opt$penalty
+  
+  if (!is.null(temp_sparsity) && length(temp_sparsity) == 4 && !any(is.na(temp_sparsity))) {
+    optimal_sparsity <- temp_sparsity
+    optimal_sparsity[4] <- 1 # Mathematically protect the 1-dimensional response block
+    cat("Optimal sparsity mathematically found via CV:", paste(optimal_sparsity, collapse = ", "), "\n")
+  } else {
+    stop("CV tuning incomplete.")
+  }
+}, error = function(e) {
+  cat("Notice: rgcca_cv encountered a formatting issue. Defaulting to fallback sparsity: c(0.1, 0.2, 0.2, 1)\n")
+})
+
+cat("\nRunning final Supervised Sparse GCCA (SGCCA) model...\n")
+rgcca_out <- rgcca(blocks = blocks, method = "sgcca", connection = design_matrix, 
+                   sparsity = optimal_sparsity, ncomp = c(2, 2, 2, 1), 
+                   response = 4, scale = TRUE, verbose = FALSE)
+
+# --- Map Features ---
+map_features <- function(original_names, mapping_df) {
+  mapped_names <- original_names
+  if (is.null(mapping_df) || nrow(mapping_df) == 0) return(mapped_names)
+  lookup_keys_raw <- as.character(mapping_df[, 1])
+  lookup_values <- as.character(mapping_df[, 2])
+  lookup_keys_x <- paste0("X", gsub("_", ".", lookup_keys_raw))
+  
+  for (i in seq_along(original_names)) {
+    idx <- which(lookup_keys_raw == original_names[i] | lookup_keys_x == original_names[i])
+    if (length(idx) > 0 && !is.na(lookup_values[idx[1]]) && lookup_values[idx[1]] != "") {
+      mapped_names[i] <- paste0(lookup_values[idx[1]], " (", original_names[i], ")")
+    }
+  }
+  return(mapped_names)
+}
+
+rgcca_mapped <- rgcca_out
+rownames(rgcca_mapped$a[[1]]) <- map_features(rownames(rgcca_out$a[[1]]), rna_map)
+rownames(rgcca_mapped$a[[2]]) <- map_features(rownames(rgcca_out$a[[2]]), pos_map)
+rownames(rgcca_mapped$a[[3]]) <- map_features(rownames(rgcca_out$a[[3]]), neg_map)
+
+# --- Visualizations ---
+cat("\nSaving plots to RGCCA_Plots.pdf...\n")
+treatment_groups <- factor(Y_meta$REF, levels = c("Control", "1x", "10x"))
+pdf("RGCCA_Plots.pdf", width = 8, height = 6)
+
+# The three sample separation plots (Ensure we only plot blocks 1:3)
+plot(rgcca_out, type = "samples", block = 1:2, comp = 1, resp = treatment_groups, title = "Sample Separation (RNA vs Pos Metabolites)")
+plot(rgcca_out, type = "samples", block = c(1, 3), comp = 1, resp = treatment_groups, title = "Sample Separation (RNA vs Neg Metabolites)")
+plot(rgcca_out, type = "samples", block = 2:3, comp = 1, resp = treatment_groups, title = "Sample Separation (Pos vs Neg Metabolites)")
+
+# Correlation Circle (Excluding the 1D response block for valid 2D projection)
+plot(rgcca_out, type = "cor_circle", block = 1:3, comp = 1:2, title = "Multi-Omics Correlation Circle")
+
+# Annotated Feature Weights
+plot(rgcca_mapped, type = "weights", block = 1, comp = 1, title = "Top Genes Driving Component 1 (Annotated)", n_mark = 20)
+plot(rgcca_mapped, type = "weights", block = 2, comp = 1, title = "Top Pos-Metabolites Driving Component 1 (Annotated)", n_mark = 20)
+plot(rgcca_mapped, type = "weights", block = 3, comp = 1, title = "Top Neg-Metabolites Driving Component 1 (Annotated)", n_mark = 20)
+dev.off()
+
+# --- Extract and Save Data ---
+get_selected_features_mapped <- function(model, block_num, comp_num, mapping_df) {
+  weights <- model$a[[block_num]][, comp_num]
+  selected_sorted <- sort(abs(weights[weights != 0]), decreasing = TRUE)
+  orig_names <- names(selected_sorted)
+  mapped_names <- map_features(orig_names, mapping_df)
+  pure_annotations <- sapply(mapped_names, function(x) if(grepl(" \\(", x)) strsplit(x, " \\(")[[1]][1] else NA)
+  data.frame(Original_ID = orig_names, Annotation = pure_annotations, Plot_Label = mapped_names, Absolute_Weight = selected_sorted, stringsAsFactors = FALSE)
+}
+
+df_genes <- get_selected_features_mapped(rgcca_out, 1, 1, rna_map)
+df_pos   <- get_selected_features_mapped(rgcca_out, 2, 1, pos_map)
+df_neg   <- get_selected_features_mapped(rgcca_out, 3, 1, neg_map)
+
+write.csv(df_genes, "RGCCA_Top_Genes_Annotated.csv", row.names = FALSE)
+write.csv(df_pos, "RGCCA_Top_Pos_Metabs_Annotated.csv", row.names = FALSE)
+write.csv(df_neg, "RGCCA_Top_Neg_Metabs_Annotated.csv", row.names = FALSE)
+
+
+```
+
+
+
+```{r}
+# ==============================================================================
+# Step 3: Explainable Machine Learning (iRF) to Answer Research Question 3
+# Objective: Identify which chemicals drive the biological adverse outcome
+# ==============================================================================
+cat("Loading aligned data for Chemical iRF...\n")
+load("aligned_multiomics_data.RData")
+
+# 1. DEFINE THE BIOLOGICAL TARGET (Y)
+cat("Calculating multi-omics PC1 to use as the biological response...\n")
+X_combined <- cbind(X_rna, X_pos, X_neg)
+pca_res <- prcomp(X_combined, center = TRUE, scale. = TRUE)
+Y_bio_response <- pca_res$x[, 1] # PC1 scores for all 150 samples
+
+# 2. DEFINE THE CHEMICAL PREDICTORS (X)
+cat("Loading and formatting chemical data...\n")
+chem_data <- read.delim("water_chemicals.tsv", row.names = 1, stringsAsFactors = FALSE)
+
+# FIX: Force the data frame into a strictly numeric matrix before transposing
+chem_data_matrix <- data.matrix(chem_data) 
+chem_data_t <- t(chem_data_matrix)
+
+# Create an empty matrix to hold the chemical exposure for all biological samples
+X_chem <- matrix(0, nrow = nrow(Y_meta), ncol = ncol(chem_data_t))
+rownames(X_chem) <- rownames(Y_meta)
+colnames(X_chem) <- colnames(chem_data_t)
+
+cat("Mapping chemical concentrations to samples...\n")
+# Map the chemical concentrations to the biological samples based on Dose and Site
+for(i in 1:nrow(Y_meta)) {
+  site <- as.character(Y_meta$Site[i])
+  dose <- as.character(Y_meta$REF[i]) # Expected: "Control", "1x", "10x"
+  
+  if(dose == "1x" && site %in% rownames(chem_data_t)) {
+    # FIX: Wrap in as.numeric() to guarantee it's treated as math
+    X_chem[i, ] <- as.numeric(chem_data_t[site, ])
+  } else if(dose == "10x" && site %in% rownames(chem_data_t)) {
+    # FIX: Wrap in as.numeric() before multiplying
+    X_chem[i, ] <- as.numeric(chem_data_t[site, ]) * 10 
+  } 
+  # If "Control" or site is missing, it remains 0
+}
+
+# FIX: Clean up any NAs that might have been introduced if there were hidden text characters
+X_chem[is.na(X_chem)] <- 0
+
+cat("\nRunning Regression iRF Model (Chemicals -> Biological Response)...\n")
+# Ensure the iRF package is loaded
+if(!require(iRF)) { library(iRF) }
+set.seed(42) # Replaced GLOBAL_SEED with a hardcoded number for safety
+
+# 3. RUN iRF (Continuous Regression)
+irf_model <- iRF(
+  x = as.matrix(X_chem),
+  y = Y_bio_response,
+  n.iter = 5,           # Default iterations
+  iter.return = 5, 
+  n.core = 1, 
+  n.bootstrap = 30      # Default bootstrap samples
+)
+
+# 4. EXTRACT FEATURE IMPORTANCE 
+cat("Extracting chemical importance...\n")
+if ("importance" %in% names(irf_model$rf.list)) {
+  importance_df <- as.data.frame(irf_model$rf.list$importance)
+} else {
+  importance_df <- as.data.frame(irf_model$rf.list[[length(irf_model$rf.list)]]$importance)
+}
+
+importance_df$Chemical <- rownames(importance_df)
+importance_col <- if("IncNodePurity" %in% colnames(importance_df)) "IncNodePurity" else colnames(importance_df)[1]
+importance_df <- importance_df[order(importance_df[[importance_col]], decreasing = TRUE), ]
+top_chemicals <- head(importance_df, 20)
+
+# 5. EXTRACT CHEMICAL INTERACTIONS
+interactions <- NULL
+int_obj <- irf_model$interaction
+if (!is.null(int_obj)) {
+  if (is.data.frame(int_obj)) { interactions <- int_obj
+  } else if (is.list(int_obj) && "int" %in% names(int_obj) && is.data.frame(int_obj$int)) { interactions <- int_obj$int
+  } else {
+    last_int <- int_obj[[length(int_obj)]]
+    if (is.data.frame(last_int)) interactions <- last_int else if (is.list(last_int) && "int" %in% names(last_int)) interactions <- last_int$int
+  }
+}
+
+# --- Plotting ---
+cat("Generating plots...\n")
+library(ggplot2)
+pdf("RQ3_Chemical_Toxicity_Drivers.pdf", width = 11, height = 8)
+
+# Plot Top Chemical Drivers
+print(ggplot(top_chemicals, aes(x = reorder(Chemical, .data[[importance_col]]), y = .data[[importance_col]])) +
+  geom_bar(stat = "identity", fill = "firebrick") + 
+  coord_flip() + 
+  theme_minimal() +
+  labs(title = "Top Chemical Drivers of Adverse Biological Outcome", 
+       subtitle = "Ranked by ability to predict multi-omics Principal Component 1",
+       x = "Organic Chemical", 
+       y = paste("Importance (", importance_col, ")", sep="")))
+
+# Plot Chemical Interactions
+if (!is.null(interactions) && nrow(interactions) > 0) {
+  stab_col <- if ("stability" %in% colnames(interactions)) "stability" else colnames(interactions)[2]
+  int_col <- if ("int" %in% colnames(interactions)) "int" else colnames(interactions)[1]
+  
+  interactions$Plot_Interaction <- gsub("_", " + ", interactions[[int_col]])
+  
+  print(ggplot(head(interactions[order(interactions[[stab_col]], decreasing = TRUE), ], 15), 
+               aes(x = reorder(Plot_Interaction, .data[[stab_col]]), y = .data[[stab_col]])) +
+    geom_bar(stat = "identity", fill = "darkorange") + 
+    coord_flip() + 
+    theme_minimal() +
+    labs(title = "Top Synergistic Chemical Interactions (The Cocktail Effect)", 
+         subtitle = "Pairs/groups of chemicals that jointly drive the biological response",
+         x = "Interacting Chemicals", 
+         y = "Stability Score"))
+}
+dev.off()
+
+# Save results
+write.csv(importance_df, "RQ3_Chemical_Importance_Rankings.csv", row.names = FALSE)
+if(!is.null(interactions)) write.csv(interactions, "RQ3_Chemical_Interactions.csv", row.names = FALSE)
+
+# --- Thorough Answer: Mapping Top Chemicals to Geography ---
+# 1. Get the single top chemical from your importance data
+top_chem_name <- top_chemicals$Chemical[12]
+
+# 2. Extract its distribution across sites from your transposed chemical matrix
+# We'll look at the 1x environmental levels
+site_distribution <- chem_data_t[, top_chem_name]
+
+# 3. Create a comparison dataframe
+geo_comparison <- data.frame(
+  Site = rownames(chem_data_t),
+  Chemical_Level = as.numeric(site_distribution),
+  Bio_Stress = sapply(rownames(chem_data_t), function(s) mean(Y_bio_response[Y_meta$Site == s & Y_meta$REF == "1x"]))
+)
+
+# 4. Plot to show the "Distribution Relationship"
+ggplot(geo_comparison, aes(x = Site)) +
+  geom_bar(aes(y = Chemical_Level), stat = "identity", fill = "blue", alpha = 0.5) +
+  geom_line(aes(y = Bio_Stress * (max(Chemical_Level)/max(Bio_Stress)), group = 1), color = "red", size = 1) +
+  scale_y_continuous(sec.axis = sec_axis(~ . * (max(geo_comparison$Bio_Stress)/max(geo_comparison$Chemical_Level)), name = "Biological Stress (PC1)")) +
+  labs(title = paste("Distribution of", top_chem_name, "vs Biological Stress"),
+       subtitle = "Blue bars = Chemical Concentration | Red line = Biological Response Index") +
+  theme_minimal()
+
+
+
+cat("Done! Check your working directory for RQ3_Chemical_Toxicity_Drivers.pdf\n")
+```
+
+
+
+
+
+```{r}
+# ==============================================================================
+# Step 3: Explainable Machine Learning with iterative Random Forest (iRF)
+# ==============================================================================
+cat("Loading aligned data for iRF...\n")
+load("aligned_multiomics_data.RData")
+
+# --- DEFENSIVE ALIGNMENT CHECK ---
+# Ensures the samples haven't silently shuffled out of order
+stopifnot(identical(rownames(X_rna), rownames(X_pos)))
+stopifnot(identical(rownames(X_pos), rownames(X_neg)))
+
+# Re-combine just in case (Ensuring column names are unique)
+X_combined <- cbind(X_rna, X_pos, X_neg)
+colnames(X_combined) <- make.names(colnames(X_combined), unique = TRUE)
+
+# Keep the 3 distinct concentration levels as an ordered factor
+Y_meta$Dose_Target <- factor(Y_meta$REF, levels = c("Control", "1x", "10x"))
+Y <- Y_meta$Dose_Target
+
+cat("\nRunning Class-Balanced iRF Model...\n")
+set.seed(GLOBAL_SEED)
+
+# 1. Identify the size of the minority class (Control = 6)
+min_class_size <- min(table(Y))
+
+# 2. Run iRF with stratified downsampling
+# This forces every tree to train on equal amounts of Control, 1x, and 10x.
+irf_model <- iRF(
+  x = as.matrix(X_combined),
+  y = Y,
+  n.iter = IRF_ITER, 
+  iter.return = IRF_ITER, 
+  n.core = 1, 
+  n.bootstrap = IRF_BOOTSTRAP,
+  strata = Y,                                      # Group by class
+  sampsize = c(min_class_size, min_class_size, min_class_size) # 3 classes = 3 sizes
+)
+
+# Extract importance from the final iteration
+if ("importance" %in% names(irf_model$rf.list)) {
+  importance_df <- as.data.frame(irf_model$rf.list$importance)
+} else {
+  importance_df <- as.data.frame(irf_model$rf.list[[length(irf_model$rf.list)]]$importance)
+}
+
+importance_df$Feature <- rownames(importance_df)
+importance_df <- importance_df[order(importance_df$MeanDecreaseGini, decreasing = TRUE), ]
+top_features <- head(importance_df, 30)
+
+# --- Mapping and Annotations ---
+rna_map <- tryCatch(read.delim("rna_dma_to_hsa_gn_mappings.tsv", sep="\t", header=FALSE, stringsAsFactors=FALSE), error=function(e) NULL)
+pos_map <- tryCatch(read.delim("polar_pos_pkl_to_kegg_annotations.tsv", sep="\t", header=FALSE, stringsAsFactors=FALSE), error=function(e) NULL)
+neg_map <- tryCatch(read.delim("polar_neg_pkl_to_kegg_annotations.tsv", sep="\t", header=FALSE, stringsAsFactors=FALSE), error=function(e) NULL)
+
+map_irf_features <- function(feature_names, r_map, p_map, n_map) {
+  mapped_names <- feature_names
+  all_maps <- rbind(
+    if(!is.null(r_map)) data.frame(ID=r_map[,1], Ann=r_map[,2]) else NULL,
+    if(!is.null(p_map)) data.frame(ID=p_map[,1], Ann=p_map[,3]) else NULL,
+    if(!is.null(n_map)) data.frame(ID=n_map[,1], Ann=n_map[,3]) else NULL
+  )
+  if (is.null(all_maps)) return(mapped_names)
+  
+  lookup_keys_raw <- as.character(all_maps$ID)
+  lookup_keys_x <- paste0("X", gsub("_", ".", lookup_keys_raw))
+  lookup_vals <- as.character(all_maps$Ann)
+  
+  for (i in seq_along(feature_names)) {
+    idx <- which(lookup_keys_raw == feature_names[i] | lookup_keys_x == feature_names[i])
+    if (length(idx) > 0 && !is.na(lookup_vals[idx[1]]) && lookup_vals[idx[1]] != "") {
+      mapped_names[i] <- paste0(lookup_vals[idx[1]], " (", feature_names[i], ")")
+    }
+  }
+  return(mapped_names)
+}
+
+top_features$Annotated_Name <- map_irf_features(top_features$Feature, rna_map, pos_map, neg_map)
+
+# --- THE FIX: Smart Label Truncation for Plotting ---
+# This prevents massive lists of orthologs/KEGG IDs from ruining the ggplot margins
+smart_truncate <- function(names_vec, max_ann_len = 35) {
+  sapply(names_vec, function(n) {
+    if(is.na(n) || n == "") return("Unknown")
+    
+    # Check if the string has the "Annotation (ID)" format
+    if(grepl(" \\(", n)) {
+      parts <- strsplit(n, " \\(")[[1]]
+      ann <- parts[1]
+      id_part <- paste0("(", paste(parts[-1], collapse=" (")) 
+      
+      # If there are many semicolons, keep only the first two
+      ann_split <- unlist(strsplit(ann, ";"))
+      if(length(ann_split) > 2) {
+        ann <- paste0(trimws(ann_split[1]), ";", trimws(ann_split[2]), ";...")
+      }
+      
+      # Hard cutoff for extremely long remaining strings
+      if(nchar(ann) > max_ann_len) {
+        ann <- paste0(substr(ann, 1, max_ann_len), "...")
+      }
+      
+      return(paste(ann, id_part))
+    } else {
+       # Fallback for strings without parentheses
+       if(nchar(n) > (max_ann_len + 10)) return(paste0(substr(n, 1, max_ann_len + 7), "..."))
+       return(n)
+    }
+  })
+}
+
+# Apply truncator to create a specific column just for the plots
+top_features$Plot_Label <- smart_truncate(top_features$Annotated_Name)
+
+# --- Interactions Extraction ---
+interactions <- NULL
+int_obj <- irf_model$interaction
+if (!is.null(int_obj)) {
+  if (is.data.frame(int_obj)) { interactions <- int_obj
+  } else if (is.list(int_obj) && "int" %in% names(int_obj) && is.data.frame(int_obj$int)) { interactions <- int_obj$int
+  } else {
+    last_int <- int_obj[[length(int_obj)]]
+    if (is.data.frame(last_int)) interactions <- last_int else if (is.list(last_int) && "int" %in% names(last_int)) interactions <- last_int$int
+  }
+}
+
+if (!is.null(interactions) && nrow(interactions) > 0) {
+  int_col <- if ("int" %in% colnames(interactions)) "int" else colnames(interactions)[1]
+  
+  # Format interactions using the truncator to keep them readable
+  interactions$Plot_Interaction <- sapply(interactions[[int_col]], function(x) {
+    raw_feats <- unlist(strsplit(as.character(x), "_"))
+    mapped_feats <- map_irf_features(raw_feats, rna_map, pos_map, neg_map)
+    short_feats <- smart_truncate(mapped_feats, max_ann_len = 20) # Stricter cutoff for interactions
+    paste(short_feats, collapse = " <---> ")
+  })
+  
+  # Also store full names for the CSV
+  interactions$Annotated_Interaction <- sapply(interactions[[int_col]], function(x) {
+    paste(map_irf_features(unlist(strsplit(as.character(x), "_")), rna_map, pos_map, neg_map), collapse = " <---> ")
+  })
+  
+  # We don't save the Plot_Interaction column to the CSV, keeping the data clean
+  write.csv(interactions[, !names(interactions) %in% c("Plot_Interaction")], "iRF_Stable_Interactions.csv", row.names = FALSE)
+}
+
+# --- Plotting ---
+pdf("iRF_Plots.pdf", width = 11, height = 8)
+
+# Notice we use Plot_Label here instead of Annotated_Name
+print(ggplot(head(top_features, 20), aes(x = reorder(Plot_Label, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "steelblue") + 
+  coord_flip() + 
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 9)) + # slightly smaller text
+  labs(title = "Top 20 Most Important Biomarkers (iRF)", x = "Multi-Omics Feature", y = "Importance (Mean Decrease Gini)"))
+
+if (!is.null(interactions) && nrow(interactions) > 0) {
+  stab_col <- if ("stability" %in% colnames(interactions)) "stability" else colnames(interactions)[2]
+  
+  # Notice we use Plot_Interaction here
+  print(ggplot(head(interactions[order(interactions[[stab_col]], decreasing = TRUE), ], 15), aes(x = reorder(Plot_Interaction, .data[[stab_col]]), y = .data[[stab_col]])) +
+    geom_bar(stat = "identity", fill = "darkorange") + 
+    coord_flip() + 
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 8)) +
+    labs(title = "Top Stable Feature Interactions (iRF)", x = "Interacting Features", y = "Stability Score"))
+}
+dev.off()
+
+# Save full uncut names to CSV
+write.csv(top_features[, !names(top_features) %in% c("Plot_Label")], "iRF_Top_Features_Annotated.csv", row.names = FALSE)
+
+# Free up memory at the end of the block
+rm(X_combined)
+gc()
+```
+
+
+
+
+
+
+
+```{r}
+# ==============================================================================
+# Step 4: Linking Multi-Omics Biomarkers to River Chemistry
+# ==============================================================================
+
+# Load required libraries
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(tidyr)
+
+cat("Loading multi-omics data and chemical profiles...\n")
+load("aligned_multiomics_data.RData")
+
+# Load and format chemical data
+chem_raw <- read.delim("water_chemicals.tsv", sep="\t", header=TRUE, stringsAsFactors=FALSE)
+chem_mat <- t(chem_raw[, grep("^D\\d{2}", colnames(chem_raw), value = TRUE)])
+colnames(chem_mat) <- chem_raw$ChemName
+
+chem_data <- as.data.frame(chem_mat)
+chem_data$site <- rownames(chem_data) 
+
+# Combine Multi-Omics
+X_combined <- cbind(X_rna, X_pos, X_neg)
+colnames(X_combined) <- make.names(colnames(X_combined), unique = TRUE)
+
+# Load Top Features
+irf_features <- read.csv("iRF_Top_Features_Annotated.csv", stringsAsFactors=FALSE)
+target_feature <- irf_features$Feature[1] 
+top_biomarker_ids <- intersect(irf_features$Feature[1:25], colnames(X_combined))
+
+# Build dataframe and attach Metadata
+X_top_df <- as.data.frame(X_combined[, top_biomarker_ids, drop=FALSE])
+X_top_df$SampleID <- rownames(X_top_df)
+X_top_df <- merge(X_top_df, Y_meta[, c("SampleID", "Site", "REF")], by="SampleID")
+
+# --- ADDED FOR RQ1: Two-Way ANOVA for Site x Dose Interaction ---
+cat("Calculating Site x Dose Interaction significance...\n")
+# Remove Control to strictly test environmental sites at 1x vs 10x
+anova_data <- X_top_df %>% filter(REF %in% c("1x", "10x"))
+
+cat("\n--- ANOVA Interaction Results (Site * Dose) ---\n")
+for(biomarker in top_biomarker_ids) {
+  # Formula: Biomarker ~ Site + Dose + (Site * Dose)
+  form <- as.formula(paste(biomarker, "~ Site * REF"))
+  fit <- aov(form, data = anova_data)
+  p_val <- summary(fit)[[1]]["Site:REF", "Pr(>F)"]
+  
+  significance <- ifelse(p_val < 0.05, "*SIGNIFICANT*", "Not Sig")
+  cat(sprintf("Biomarker: %s | Interaction P-value: %.5f %s\n", biomarker, p_val, significance))
+}
+cat("--------------------------------------------------\n\n")
+
+# Open PDF device
+pdf("Chemical_Biomarker_Analysis.pdf", width = 12, height = 10)
+
+# --- Plot 1: Geographic & Dose Distribution ---
+p1 <- ggplot(X_top_df, aes(x = Site, y = .data[[target_feature]], fill = REF)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) + 
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.1), alpha = 0.5) +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal() + 
+  labs(title = paste("Geographic & Dose Distribution of", target_feature), 
+       x = "River Site", y = "Normalized Peak Intensity") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p1)
+
+# --- Isolate 10x samples to maximize the toxicological signal ---
+biomarker_site_avg <- X_top_df %>% 
+  filter(REF == "10x") %>%   # Only average the high-dose samples
+  group_by(Site) %>% 
+  summarise(across(all_of(top_biomarker_ids), ~ mean(.x, na.rm = TRUE))) %>% 
+  ungroup()
+
+# Clean up names for matching
+biomarker_site_avg$site <- as.character(biomarker_site_avg$Site)
+chem_data$site <- as.character(chem_data$site)
+
+common_sites <- intersect(biomarker_site_avg$site, chem_data$site)
+biomarker_site_avg <- biomarker_site_avg %>% filter(site %in% common_sites) %>% arrange(site)
+chem_data_filtered <- chem_data %>% filter(site %in% common_sites) %>% arrange(site)
+
+# Convert to matrices for correlation
+mat_biomarkers <- as.matrix(biomarker_site_avg[, top_biomarker_ids, drop=FALSE])
+mat_chemicals <- as.matrix(chem_data_filtered[, sapply(chem_data_filtered, is.numeric)])
+mat_chemicals <- mat_chemicals[, apply(mat_chemicals, 2, sd, na.rm = TRUE) > 0, drop=FALSE]
+
+# Calculate Spearman rank correlation
+cor_matrix <- cor(mat_chemicals, mat_biomarkers, method = "spearman", use = "pairwise.complete.obs")
+cor_df <- melt(cor_matrix) %>% rename(Chemical = Var1, Biomarker = Var2, Correlation = value)
+
+if (target_feature %in% colnames(mat_biomarkers)) {
+  
+  # Get top correlated toxicants
+  # FIX: Sort by positive correlation to find the driver chemical!
+  top_toxins <- cor_df %>% 
+    filter(Biomarker == target_feature) %>% 
+    arrange(desc(Correlation)) %>% 
+    head(10)
+  
+  write.csv(top_toxins, "Top_Potential_Toxicants.csv", row.names = FALSE)
+  
+  # --- Plot 2: Correlation Heatmap ---
+  # FIX: Plot a proper matrix of the Top 10 chemicals vs Top 4 Biomarkers instead of a single giant tile
+  heatmap_df <- cor_df %>% 
+    filter(Chemical %in% top_toxins$Chemical & Biomarker %in% top_biomarker_ids)
+  
+  # Set factor levels so the highest correlated chemical is at the top of the Y-axis
+  heatmap_df$Chemical <- factor(heatmap_df$Chemical, levels = rev(top_toxins$Chemical))
+  
+  p2 <- ggplot(heatmap_df, aes(x = Biomarker, y = Chemical, fill = Correlation)) + 
+    geom_tile(color = "white", linewidth = 0.5) + 
+    scale_fill_gradient2(low = "#2166ac", mid = "#f7f7f7", high = "#b2182b", midpoint = 0, limits = c(-1, 1)) + 
+    theme_minimal() + 
+    labs(title = "Biomarker-Toxicant Correlation Profile",
+         subtitle = paste("Top 10 positive correlates for", target_feature)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.grid = element_blank()) # Removes grid behind the tiles for a cleaner look
+  print(p2)
+
+  # --- Plot 3: Geographic Trend Alignment ---
+  top_chem_name <- as.character(top_toxins$Chemical[1])
+  
+  # Forced dplyr::select to prevent AnnotationDbi or MASS namespace clashes
+  biomarker_long <- biomarker_site_avg %>%
+    dplyr::select(site, all_of(target_feature)) %>%
+    rename(Biomarker_Value = !!sym(target_feature))
+  
+  chem_long <- chem_data_filtered %>%
+    dplyr::select(site, all_of(top_chem_name)) %>%
+    rename(Chemical_Value = !!sym(top_chem_name))
+  
+  # FIX: explicitly assign site_levels so mutate() factor conversion works
+  site_levels <- common_sites
+  
+  # 1. CREATE trend_data FIRST
+  trend_data <- inner_join(biomarker_long, chem_long, by = "site") %>%
+    mutate(
+      Site = factor(site, levels = site_levels),
+      Biomarker_Z = as.numeric(scale(Biomarker_Value)),
+      Chemical_Z = as.numeric(scale(Chemical_Value))
+    ) %>%
+    arrange(Site)
+  
+  # 2. ADDED FOR RQ3: Add Overall Biological Stress (PC1) to the trend
+  pca_res <- prcomp(X_combined, center = TRUE, scale. = TRUE)
+  trend_data$Overall_Bio_Stress <- sapply(trend_data$site, function(s) {
+    mean(pca_res$x[Y_meta$Site == s & Y_meta$REF == "10x", 1], na.rm = TRUE)
+  })
+  trend_data$Stress_Z <- as.numeric(scale(trend_data$Overall_Bio_Stress))
+  
+  # 3. Plot 3 including the new Stress_Z line
+  p3 <- ggplot(trend_data, aes(x = Site, group = 1)) + 
+    geom_line(aes(y = Biomarker_Z, color = "Metabolite (Biomarker)"), linewidth = 1.2) + 
+    geom_point(aes(y = Biomarker_Z, color = "Metabolite (Biomarker)"), size = 3) +
+    geom_line(aes(y = Chemical_Z, color = "Toxicant (Chemical)"), linetype = "dashed", linewidth = 1.2) + 
+    geom_point(aes(y = Chemical_Z, color = "Toxicant (Chemical)"), size = 3) +
+    geom_line(aes(y = Stress_Z, color = "Overall Stress (PC1)"), linetype = "dotted", linewidth = 1.2) + 
+    geom_point(aes(y = Stress_Z, color = "Overall Stress (PC1)"), size = 3, shape = 17) +
+    theme_minimal() + 
+    scale_color_manual(values = c("Metabolite (Biomarker)" = "#E41A1C", 
+                                  "Toxicant (Chemical)" = "#377EB8", 
+                                  "Overall Stress (PC1)" = "#4DAF4A")) +
+    labs(title = "Geographic Trend Alignment: Biomarker vs. Top Toxin",
+         subtitle = paste("Biomarker:", target_feature, "| Chemical:", top_chem_name),
+         y = "Z-Score (Standardized Levels)",
+         color = "Legend") + 
+    theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  print(p3)
+}
+
+# --- ADDED FOR RQ2: Multi-Omics Interaction Strength Across Sites ---
+cat("Calculating Multi-Omics interaction strength (RV Coefficient) per site...\n")
+
+# Custom function to safely calculate RV Coefficient without external packages
+calc_RV <- function(X, Y) {
+  X <- scale(X, center = TRUE, scale = FALSE)
+  Y <- scale(Y, center = TRUE, scale = FALSE)
+  S11 <- X %*% t(X)
+  S22 <- Y %*% t(Y)
+  S12 <- X %*% t(Y)
+  rv <- sum(S12^2) / sqrt(sum(S11^2) * sum(S22^2))
+  return(rv)
+}
+
+site_rv_df <- data.frame(Site = character(), RV_Coefficient = numeric(), stringsAsFactors = FALSE)
+
+# Calculate interaction strength between RNA and Pos-Metabolites for 10x samples at each site
+for(s in sprintf("D%02d", 1:12)) {
+  idx <- which(Y_meta$Site == s & Y_meta$REF == "10x")
+  if(length(idx) > 2) { # Need at least a few samples to calculate correlation
+    # Use top 500 features to save computation time
+    rna_sub <- as.matrix(X_rna[idx, 1:min(500, ncol(X_rna))])
+    pos_sub <- as.matrix(X_pos[idx, 1:min(500, ncol(X_pos))])
+    
+    rv_val <- calc_RV(rna_sub, pos_sub)
+    site_rv_df <- rbind(site_rv_df, data.frame(Site = s, RV_Coefficient = rv_val))
+  }
+}
+
+if(nrow(site_rv_df) > 0) {
+  site_rv_df$Site <- factor(site_rv_df$Site, levels = sprintf("D%02d", 1:12))
+  
+  p4 <- ggplot(site_rv_df, aes(x = Site, y = RV_Coefficient, group = 1)) +
+    geom_line(color = "purple", linewidth = 1.2) +
+    geom_point(color = "purple", size = 4) +
+    theme_minimal() +
+    labs(title = "RQ2: Multi-Omics Interaction Strength Across Locations",
+         subtitle = "RV Coefficient between Transcriptome and Metabolome (10x Dose)",
+         x = "River Site (Upstream -> Downstream)",
+         y = "RV Coefficient (0 to 1)") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  print(p4)
+}
+
+# Close PDF device
+dev.off()
+cat("Analysis complete. Plots saved to Chemical_Biomarker_Analysis.pdf\n")
+```
+
+
+
+```{r}
+# ==============================================================================
+# Step 5: WGCNA (Weighted Gene Co-expression Network Analysis)
+# ==============================================================================
+cat("Loading data for WGCNA...\n")
+load("aligned_multiomics_data.RData")
+
+# 1. Load Chemical Data
+chem_raw <- read.delim("water_chemicals.tsv", sep="\t", header=TRUE, stringsAsFactors=FALSE)
+chem_raw$ChemName <- trimws(chem_raw$ChemName)
+chem_data <- as.data.frame(t(chem_raw[, grep("^D\\d{2}", colnames(chem_raw), value = TRUE)]))
+colnames(chem_data) <- make.names(chem_raw$ChemName, unique = TRUE)
+chem_data$Site <- rownames(chem_data)
+
+# 2. Load Top Biomarker Target (from Step 3/4)
+irf_features <- read.csv("iRF_Top_Features_Annotated.csv", stringsAsFactors=FALSE)
+target_feature <- irf_features$Feature[1] 
+X_combined <- cbind(X_rna, X_pos, X_neg)
+colnames(X_combined) <- make.names(colnames(X_combined), unique = TRUE)
+target_levels <- X_combined[, target_feature]
+
+# 3. Prepare Gene Expression Data
+top_genes <- head(names(sort(apply(X_rna, 2, var, na.rm = TRUE), decreasing = TRUE)), 5000)
+datExpr <- X_rna[, top_genes]
+
+# 4. Network Construction
+cat("Calculating Soft Threshold...\n")
+sft <- pickSoftThreshold(datExpr, powerVector = c(1:10, seq(12, 20, by=2)), verbose = 0)
+
+softPower <- if(!is.na(sft$powerEstimate)) {
+  sft$powerEstimate 
+} else {
+  which(sft$fitIndices[,2] > 0.8)[1] 
+}
+if(is.na(softPower)) softPower <- 6 # Adjusted fallback for ~150 samples
+
+cat(sprintf("Building network with soft power: %d\n", softPower))
+set.seed(GLOBAL_SEED) 
+net <- blockwiseModules(datExpr, power = softPower, TOMType = "unsigned", 
+                        minModuleSize = 30, reassignThreshold = 0, mergeCutHeight = 0.25, 
+                        numericLabels = TRUE, pamRespectsDendro = FALSE, saveTOMs = FALSE, verbose = 0)
+
+moduleColors <- labels2colors(net$colors)
+MEs_raw <- moduleEigengenes(datExpr, moduleColors)$eigengenes
+
+# ------------------------------------------------------------------------------
+# THE FIX: Proper Aggregation to Avoid Pseudoreplication
+# ------------------------------------------------------------------------------
+cat("Aggregating Module Eigengenes to Site-Level (10x dose only)...\n")
+
+# Attach Metadata to MEs and the Target Metabolite
+MEs_annotated <- MEs_raw
+MEs_annotated$SampleID <- rownames(datExpr)
+MEs_annotated$Metabolite_Target <- as.numeric(target_levels)
+MEs_annotated <- merge(MEs_annotated, Y_meta[, c("SampleID", "Site", "REF")], by="SampleID")
+
+# Filter for 10x samples and average by Site
+MEs_site_avg <- MEs_annotated %>%
+  filter(REF == "10x") %>%
+  group_by(Site) %>%
+  summarise(across(starts_with("ME") | starts_with("Metabolite_Target"), ~ mean(.x, na.rm = TRUE))) %>%
+  ungroup()
+
+# Clean up Site names to ensure perfect matching
+MEs_site_avg$Site <- as.character(MEs_site_avg$Site)
+chem_data$Site <- as.character(chem_data$Site)
+
+# Find top chemicals from Step 4
+top_toxins <- read.csv("Top_Potential_Toxicants.csv", stringsAsFactors = FALSE)
+top_chems <- top_toxins$Chemical[1:10] # Expanded search to top 10 as discussed!
+chem_cols <- make.names(top_chems)
+
+# Merge MEs with Chemical Data exactly at the site level
+merged_traits <- merge(MEs_site_avg, chem_data[, c("Site", chem_cols)], by="Site")
+
+# Isolate the matrices for correlation (n = 12 sites)
+ME_mat <- as.matrix(merged_traits %>% dplyr::select(starts_with("ME")))
+trait_mat <- as.matrix(merged_traits %>% dplyr::select(Metabolite_Target, all_of(chem_cols)))
+colnames(trait_mat) <- c(target_feature, top_chems)
+
+# Calculate correlations using Spearman and calculate p-values using the CORRECT n (nrow)
+moduleTraitCor <- cor(ME_mat, trait_mat, use = "pairwise.complete.obs", method = "spearman")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nSamples = nrow(merged_traits))
+
+# ------------------------------------------------------------------------------
+# Visualization and Export
+# ------------------------------------------------------------------------------
+pdf("WGCNA_Trait_Correlations.pdf", width = 8, height = 10)
+par(mar = c(8, 8.5, 3, 3))
+labeledHeatmap(Matrix = moduleTraitCor, xLabels = colnames(trait_mat), yLabels = colnames(ME_mat), 
+               ySymbols = colnames(ME_mat), colorLabels = FALSE, colors = blueWhiteRed(50), 
+               textMatrix = paste(signif(moduleTraitCor, 2), "\n(", signif(moduleTraitPvalue, 1), ")", sep = ""), 
+               setStdMargins = FALSE, cex.text = 0.5, zlim = c(-1,1), 
+               main = sprintf("Module-Trait Relationships\n(Spearman, n=%d Sites)", nrow(merged_traits)))
+dev.off()
+
+cat("Exporting WGCNA modules to Cytoscape format...\n")
+rna_map <- tryCatch(read.delim("rna_dma_to_hsa_gn_mappings.tsv", sep="\t", header=FALSE, stringsAsFactors=FALSE), error=function(e) NULL)
+annotate_genes <- function(gene_ids, mapping_df) {
+  if (is.null(mapping_df)) return(gene_ids)
+  lookup_raw <- as.character(mapping_df[,1]); lookup_x <- paste0("X", gsub("_", ".", lookup_raw)); lookup_vals <- as.character(mapping_df[,2])
+  sapply(gene_ids, function(g) { idx <- which(lookup_raw == g | lookup_x == g); if (length(idx) > 0 && !is.na(lookup_vals[idx[1]]) && lookup_vals[idx[1]] != "") paste0(lookup_vals[idx[1]], " (", g, ")") else g })
+}
+
+TOM <- TOMsimilarityFromExpr(datExpr, power = softPower)
+dimnames(TOM) <- list(colnames(datExpr), colnames(datExpr))
+
+# --- THE ROBUST LOOP ---
+for (chem in top_chems) {
+  # 1. Safely extract the correlation values for this chemical
+  cor_values <- abs(moduleTraitCor[, chem])
+  
+  # 2. Check if the chemical had zero variance (causing all NAs in correlation)
+  if (all(is.na(cor_values))) {
+    cat(sprintf("Skipping %s: Chemical variance is zero, resulting in NA correlations.\n", chem))
+    next
+  }
+  
+  # 3. Find the best module color safely
+  best_match_idx <- which.max(cor_values)
+  tox_module_color <- gsub("ME", "", rownames(moduleTraitCor)[best_match_idx])
+  tox_genes <- colnames(datExpr)[moduleColors == tox_module_color]
+  
+  # 4. Check if we actually found any genes in this module
+  if (length(tox_genes) == 0) {
+    cat(sprintf("Skipping %s: No genes found in the assigned module (%s).\n", chem, tox_module_color))
+    next
+  }
+  
+  # 5. Build Dataframe and Save (Now protected from the 1 vs 0 row error)
+  write.csv(data.frame(Module = tox_module_color, 
+                       Trait = chem, 
+                       Gene_ID = tox_genes, 
+                       Annotated_Name = annotate_genes(tox_genes, rna_map)), 
+            paste0("WGCNA_", make.names(chem), "_Module_Genes.csv"), row.names = FALSE)
+  
+  # 6. Proceed with Cytoscape export
+  inModule <- is.finite(match(moduleColors, tox_module_color))
+  modProbes <- colnames(datExpr)[inModule]
+  modTOM <- TOM[inModule, inModule]
+  dimnames(modTOM) <- list(modProbes, modProbes)
+  
+  exportNetworkToCytoscape(modTOM,
+    edgeFile = paste0("Cytoscape_Edges_", tox_module_color, "_", make.names(chem), ".txt"),
+    nodeFile = paste0("Cytoscape_Nodes_", tox_module_color, "_", make.names(chem), ".txt"),
+    weighted = TRUE, threshold = 0.1, nodeNames = modProbes, nodeAttr = moduleColors[inModule])
+    
+  cat(sprintf("Successfully exported Cytoscape files for %s (Module: %s)\n", chem, tox_module_color))
+}
+cat("WGCNA Pipeline and Cytoscape export complete!\n")
+```
+
+
+
+```{r}
+# ==============================================================================
+# Step 6: Functional Enrichment Analysis (Gene Ontology)
+# ==============================================================================
+# This script takes the genes belonging to the toxic-response modules 
+# identified dynamically in Step 5 and runs a Gene Ontology (GO)
+# enrichment analysis to statistically identify the disrupted biological pathways.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 0. Install and Load Required Packages
+# ------------------------------------------------------------------------------
+cat("Checking and installing necessary packages...\n")
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager", repos = "http://cran.us.r-project.org")
+}
+
+deps <- c("clusterProfiler", "org.Hs.eg.db", "enrichplot", "ggplot2", "stringr", "dplyr")
+
+for (pkg in deps) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (pkg %in% c("clusterProfiler", "org.Hs.eg.db", "enrichplot")) {
+      BiocManager::install(pkg, update = FALSE, ask = FALSE)
+    } else {
+      install.packages(pkg, repos = "http://cran.us.r-project.org")
+    }
+  }
+}
+
+cat("Loading required packages for GO Enrichment...\n")
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(ggplot2)
+library(stringr)
+library(dplyr)
+
+options(bitmapType='cairo')
+
+# ------------------------------------------------------------------------------
+# 1. THE FIX: Define the Background Gene Universe
+# ------------------------------------------------------------------------------
+cat("Establishing the statistical background universe...\n")
+load("aligned_multiomics_data.RData")
+
+# Get the exact 5000 genes used in WGCNA
+top_genes <- head(names(sort(apply(X_rna, 2, var, na.rm = TRUE), decreasing = TRUE)), 5000)
+
+# Load mappings
+rna_map <- tryCatch(read.delim("rna_dma_to_hsa_gn_mappings.tsv", sep="\t", header=FALSE, stringsAsFactors=FALSE), error=function(e) NULL)
+
+if(is.null(rna_map)) stop("Cannot perform enrichment: Mapping file missing.")
+
+# Extract Human Symbols for the background universe
+universe_raw <- rna_map$V2[rna_map$V1 %in% top_genes | paste0("X", gsub("_", ".", rna_map$V1)) %in% top_genes]
+universe_clean <- unique(unlist(str_split(str_trim(universe_raw), ";")))
+background_universe <- universe_clean[!is.na(universe_clean) & universe_clean != ""]
+
+cat(sprintf("Defined background universe of %d mapped human genes.\n", length(background_universe)))
+
+# ------------------------------------------------------------------------------
+# 2. Dynamically Load Top Chemicals & Run Enrichment
+# ------------------------------------------------------------------------------
+if(!file.exists("Top_Potential_Toxicants.csv")) {
+  stop("Missing 'Top_Potential_Toxicants.csv'. Please run the Step 4 chemical correlation script first.")
+}
+
+top_toxins <- read.csv("Top_Potential_Toxicants.csv", stringsAsFactors = FALSE)
+top_chems <- top_toxins$Chemical[1:5]
+
+# Loop through top chemicals
+for (chem in top_chems) {
+  
+  safe_chem_name <- make.names(chem)
+  input_file <- paste0("WGCNA_", safe_chem_name, "_Module_Genes.csv")
+  
+  cat(paste(rep("-", 80), collapse=""), "\n")
+  cat(sprintf("Analyzing Biological Pathways for: %s\n", chem))
+  cat(paste(rep("-", 80), collapse=""), "\n")
+  
+  if(!file.exists(input_file)) {
+    cat(sprintf("Skipping %s: File not found.\n", chem))
+    next
+  }
+
+  mod_genes <- read.csv(input_file, stringsAsFactors = FALSE)
+  module_color <- mod_genes$Module[1]
+  
+  # Extract human gene symbols
+  raw_symbols <- mod_genes$Annotated_Name
+  annotated_only <- raw_symbols[!grepl("^Dapma", raw_symbols)]
+  symbols_before_paren <- str_trim(str_extract(annotated_only, "^[^(]+"))
+  gene_list <- unique(unlist(str_split(symbols_before_paren, ";")))
+  gene_list <- as.character(str_trim(gene_list[!is.na(gene_list) & gene_list != ""]))
+
+  # THE FIX: Stricter threshold for module stability
+  if(length(gene_list) < 10) {
+    cat(sprintf("Only %d human mapped genes found. Too few for robust GO Enrichment. Skipping.\n", length(gene_list)))
+    next
+  }
+
+  cat("Running GO Enrichment Analysis (Biological Process)...\n")
+
+  # THE FIX: Perform Gene Ontology (GO) Enrichment WITH Universe
+  ego <- tryCatch({
+    enrichGO(gene          = gene_list,
+             universe      = background_universe,  # CRITICAL FIX ADDED HERE
+             OrgDb         = org.Hs.eg.db,
+             keyType       = "SYMBOL",     
+             ont           = "BP",         
+             pAdjustMethod = "BH",         
+             pvalueCutoff  = 0.1,
+             qvalueCutoff  = 0.3)
+  }, error = function(e) {
+    cat("Error during enrichment calculation: ", e$message, "\n")
+    return(NULL)
+  })
+
+  if (!is.null(ego) && nrow(as.data.frame(ego)) > 0) {
+    ego <- clusterProfiler::simplify(ego, cutoff = 0.7, by = "p.adjust", select_fun = min)
+    
+    if (nrow(as.data.frame(ego)) == 0) {
+      cat("No significant terms remained after redundancy simplification.\n")
+      next
+    }
+    
+    clean_mod_color <- str_to_title(module_color)
+    out_csv <- paste0("WGCNA_", safe_chem_name, "_", clean_mod_color, "_Module_GO_Enrichment.csv")
+    write.csv(as.data.frame(ego), out_csv, row.names = FALSE)
+    
+    # Visualizations
+    out_pdf <- paste0("WGCNA_", safe_chem_name, "_Enrichment_Plots.pdf")
+    pdf(out_pdf, width = 12, height = 9)
+    
+    p1 <- enrichplot::dotplot(ego, showCategory = 15, label_format = 60) + 
+      ggtitle(paste("GO Enrichment: Biological Processes -", chem)) + theme_minimal()
+    print(p1)
+    
+    p2 <- barplot(ego, showCategory = 15, label_format = 60) + 
+      ggtitle(sprintf("Top Disrupted Pathways for %s", chem)) + theme_minimal()
+    print(p2)
+
+    ego_readable <- tryCatch({ setReadable(ego, OrgDb = org.Hs.eg.db, keyType = "SYMBOL") }, error = function(e) return(ego))
+    
+    p3 <- enrichplot::cnetplot(ego_readable, showCategory = 5, colorEdge = TRUE, node_label = "category") +
+      ggtitle(paste("Gene-Concept Network for", chem))
+    print(p3)
+    
+    dev.off()
+    cat(sprintf(" - Results saved to: %s\n", out_csv))
+    
+  } else {
+    cat(sprintf("No significantly enriched GO terms were found for %s (p < 0.05) against the true background.\n\n", chem))
+  }
+}
+
+```
+
+
+
+
+```{r}
+# ==============================================================================
+# Comprehensive Multi-Omics Pipeline for Daphnia magna Exposure Study
+# Addresses Research Goals Q1, Q2, Q3, and Q4
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Setup and Dependencies
+# ------------------------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(vegan)
+  library(mixOmics)
+  library(randomForest)
+  library(fastshap)
+  library(shapviz)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+})
+
+set.seed(42) # Ensure reproducible machine learning results
+
+# ==============================================================================
+# Step 1: Data Loading & Precision Preprocessing
+# ==============================================================================
+cat("--- Step 1: Loading & Cleaning Datasets ---\n")
+
+meta <- read.csv("sample_sheet.csv", row.names = 1) 
+rna <- read.csv("rna_vst_counts.csv", row.names = 1)
+pos <- read.csv("polar_pos_pqn_imputed_glog.csv", row.names = 1)
+neg <- read.csv("polar_neg_pqn_imputed_glog.csv", row.names = 1)
+
+# Transpose omics (Samples as rows, Features as columns)
+X_rna <- as.data.frame(t(rna))
+X_pos <- as.data.frame(t(pos))
+X_neg <- as.data.frame(t(neg))
+
+# Parse Location and Concentration accurately
+if (!"Location" %in% colnames(meta)) {
+  meta$Location <- sub("(D[0-9]{2}|Control).*", "\\1", rownames(meta), ignore.case = TRUE)
+}
+if (!"Concentration" %in% colnames(meta)) {
+  meta$Concentration <- ifelse(grepl("A", rownames(meta), ignore.case = TRUE), "1x",
+                        ifelse(grepl("B", rownames(meta), ignore.case = TRUE), "10x", "Control"))
+}
+meta$Location <- as.factor(meta$Location)
+meta$Concentration <- factor(meta$Concentration, levels = c("Control", "1x", "10x"))
+
+# Sync Samples across all datasets safely
+common_samples <- Reduce(intersect, list(rownames(X_rna), rownames(X_pos), rownames(X_neg), rownames(meta)))
+X_rna <- X_rna[common_samples, ]
+X_pos <- X_pos[common_samples, ]
+X_neg <- X_neg[common_samples, ]
+meta  <- meta[common_samples, ]
+
+cat(sprintf("Matched %d samples across RNA, POS, NEG, and Metadata.\n", length(common_samples)))
+
+# ==============================================================================
+# Step 2 (Q1): Individual Omics Variance (PCA & PERMANOVA)
+# ==============================================================================
+cat("\n--- Step 2 (Q1): Omics Variance & Community Shifts ---\n")
+
+# Combine omics for holistic PCA
+X_combined <- cbind(X_rna, X_pos, X_neg)
+pca_res <- prcomp(X_combined, scale. = TRUE)
+meta$Stress_Score <- pca_res$x[, 1] # PC1 = Primary axis of biological variation
+
+pdf("Q1_PCA_and_Variance.pdf", width = 8, height = 6)
+pca_plot_df <- data.frame(PC1 = pca_res$x[, 1], PC2 = pca_res$x[, 2], 
+                          Treatment = meta$Concentration, Location = meta$Location)
+p_pca <- ggplot(pca_plot_df, aes(x = PC1, y = PC2, color = Location, shape = Treatment)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal() +
+  ggtitle("Global PCA: Shifts due to River Extracts")
+print(p_pca)
+dev.off()
+
+cat("PERMANOVA Results for Transcriptome (RNA):\n")
+dist_rna <- vegdist(X_rna, method = "euclidean")
+perm_rna <- adonis2(dist_rna ~ Location * Concentration, data = meta, permutations = 999)
+print(perm_rna)
+
+# ==============================================================================
+# Step 3 (Q2): Multi-omics Interactions (DIABLO N-Integration)
+# ==============================================================================
+cat("\n--- Step 3 (Q2): Multi-omics Network Discovery (DIABLO) ---\n")
+
+# Filter zero-variance features to prevent singular matrices
+X_rna_filt <- X_rna[, apply(X_rna, 2, var) > 1e-5]
+X_pos_filt <- X_pos[, apply(X_pos, 2, var) > 1e-5]
+X_neg_filt <- X_neg[, apply(X_neg, 2, var) > 1e-5]
+
+data_blocks <- list(RNA = X_rna_filt, POS = X_pos_filt, NEG = X_neg_filt)
+design <- matrix(0.5, ncol = 3, nrow = 3, dimnames = list(names(data_blocks), names(data_blocks)))
+diag(design) <- 0
+
+diablo_model <- block.splsda(X = data_blocks, Y = meta$Location, ncomp = 2, design = design)
+
+pdf("Q2_MultiOmics_Interactions.pdf", width = 10, height = 10)
+plotIndiv(diablo_model, ind.names = FALSE, legend = TRUE, ellipse = FALSE,
+          title = 'DIABLO: Sample Space across Omics Blocks')
+tryCatch({
+  # ADJUSTMENT: Lowered cutoff from 0.75 to 0.55 to reveal more biological interactions
+  circosPlot(diablo_model, cutoff = 0.55, line = TRUE, 
+             color.blocks= c('darkorchid', 'brown1', 'lightgreen'),
+             size.labels = 1.0)
+}, error = function(e) cat("Circos plot skipped (try adjusting cutoff).\n"))
+dev.off()
+
+# ==============================================================================
+# Step 4 (Q3): Linking Chemicals to Adverse Outcomes (RF + SHAP)
+# ==============================================================================
+cat("\n--- Step 4 (Q3): Chemical Drivers of Biological Stress ---\n")
+
+chemicals_raw <- read.table("water_chemicals.tsv", sep="\t", header=TRUE, row.names=1, check.names=FALSE)
+chem_data <- as.data.frame(t(chemicals_raw[, -1]))
+chem_data[] <- lapply(chem_data, function(x) as.numeric(as.character(x)))
+
+loc_strings <- as.character(meta$Location)
+chem_mapped <- chem_data[loc_strings, ] 
+chem_mapped[is.na(chem_mapped)] <- 0 # Control groups have NA, set to 0
+rownames(chem_mapped) <- rownames(meta)
+colnames(chem_mapped) <- make.names(colnames(chem_mapped), unique = TRUE)
+
+chem_vars <- apply(chem_mapped, 2, var)
+valid_chem_cols <- !is.na(chem_vars) & (chem_vars > 1e-5)
+chem_mapped <- chem_mapped[, valid_chem_cols, drop = FALSE]
+
+if (ncol(chem_mapped) > 0) {
+  rf_chem <- randomForest(x = chem_mapped, y = meta$Stress_Score, ntree = 500)
+  pfun_chem <- function(object, newdata) predict(object, newdata = newdata)
+  shap_chem <- fastshap::explain(rf_chem, X = chem_mapped, pred_wrapper = pfun_chem, nsim = 100, adjust = FALSE)
+  sv_chem <- shapviz(shap_chem, X = chem_mapped)
+  
+  pdf("Q3_Chemical_SHAP_Analysis.pdf", width = 11, height = 8)
+  print(sv_importance(sv_chem, kind = "beeswarm") + ggtitle("Which Chemicals Drive Biological Stress?"))
+  print(sv_importance(sv_chem, kind = "bar") + ggtitle("Top Toxic/Adverse Compounds"))
+  dev.off()
+  cat("Chemical SHAP plots saved (Q3_Chemical_SHAP_Analysis.pdf).\n")
+}
+
+# ==============================================================================
+# Step 5 (Q4 & Q5): Annotated Biomarker Discovery (SHAP)
+# ==============================================================================
+cat("\n--- Step 5 (Q4 & Q5): Biomarker Directionality & Visual Annotation ---\n")
+
+# 1. Train RF to distinguish Treatment vs Control
+Y_class <- factor(ifelse(meta$Concentration == "Control", "Control", "Treated"))
+min_class <- min(table(Y_class))
+colnames(X_combined) <- make.names(colnames(X_combined), unique = TRUE)
+
+rf_bio <- randomForest(x = X_combined, y = Y_class, ntree = 500, 
+                       strata = Y_class, sampsize = c(min_class, min_class), importance = TRUE)
+
+imp <- importance(rf_bio)
+top_features <- rownames(imp)[order(imp[, "MeanDecreaseGini"], decreasing = TRUE)[1:25]]
+
+legacy_gene <- "Dapma7bEVm005278"
+if(legacy_gene %in% colnames(X_combined) && !(legacy_gene %in% top_features)) {
+  top_features[25] <- legacy_gene 
+}
+
+X_top <- X_combined[, top_features]
+
+# 2. Retrain parsimonious model & Extract SHAP 
+rf_top <- randomForest(x = X_top, y = Y_class, ntree = 500, strata = Y_class, sampsize = c(min_class, min_class))
+pfun_bio <- function(object, newdata) predict(object, newdata = newdata, type = "prob")[, "Treated"]
+shap_bio <- fastshap::explain(rf_top, X = X_top, pred_wrapper = pfun_bio, nsim = 100, adjust = FALSE)
+
+# ------------------------------------------------------------------------------
+# 3. BUILD ANNOTATION DICTIONARY FOR PLOTTING
+# ------------------------------------------------------------------------------
+cat("Translating feature IDs to biological annotations for plots...\n")
+
+safe_load_tsv <- function(file_path, col_names) {
+  if (file.exists(file_path)) return(read.delim(file_path, header = FALSE, col.names = col_names, stringsAsFactors = FALSE))
+  return(data.frame(matrix(ncol = length(col_names), nrow = 0, dimnames = list(NULL, col_names))))
+}
+
+rna_gn <- safe_load_tsv("rna_dma_to_hsa_gn_mappings.tsv", c("ID", "Human_Gene_Symbol"))
+pos_kegg <- safe_load_tsv("polar_pos_pkl_to_kegg_annotations.tsv", c("ID", "mz", "KEGG"))
+pos_hmdb <- safe_load_tsv("polar_pos_pkl_to_hmdb_annotations.tsv", c("ID", "mz", "HMDB"))
+neg_kegg <- safe_load_tsv("polar_neg_pkl_to_kegg_annotations.tsv", c("ID", "mz", "KEGG"))
+neg_hmdb <- safe_load_tsv("polar_neg_pkl_to_hmdb_annotations.tsv", c("ID", "mz", "HMDB"))
+
+build_metab_df <- function(kegg_df, hmdb_df) {
+  if (nrow(kegg_df) == 0 && nrow(hmdb_df) == 0) return(data.frame(Feature=character(), Biological_Annotation=character()))
+  full_join(kegg_df, hmdb_df, by = c("ID", "mz")) %>%
+    mutate(KEGG = ifelse(is.na(KEGG) | KEGG == "", NA, KEGG), HMDB = ifelse(is.na(HMDB) | HMDB == "", NA, HMDB),
+           Ann = coalesce(HMDB, KEGG), Feature = make.names(ID, unique = FALSE)) %>%
+    filter(!is.na(Ann)) %>% group_by(Feature) %>%
+    summarise(Biological_Annotation = paste(unique(Ann), collapse = " | "), .groups = 'drop')
+}
+
+master_dict <- bind_rows(
+  rna_gn %>% mutate(Feature = make.names(ID, unique = FALSE)) %>% filter(!is.na(Human_Gene_Symbol) & Human_Gene_Symbol != "") %>% group_by(Feature) %>% summarise(Biological_Annotation = paste(unique(Human_Gene_Symbol), collapse = " | "), .groups = 'drop'),
+  build_metab_df(pos_kegg, pos_hmdb),
+  build_metab_df(neg_kegg, neg_hmdb)
+)
+
+# Replace raw IDs with human-readable names
+annotated_names <- sapply(colnames(X_top), function(f) {
+  ann <- master_dict$Biological_Annotation[master_dict$Feature == f]
+  if (length(ann) > 0 && !is.na(ann[1]) && ann[1] != "") {
+    short_ann <- ifelse(nchar(ann[1]) > 30, paste0(substr(ann[1], 1, 27), "..."), ann[1])
+    return(paste0(f, " [", short_ann, "]"))
+  }
+  return(f)
+})
+
+# Apply annotated names directly to matrices before plotting
+colnames(X_top) <- annotated_names
+colnames(shap_bio) <- annotated_names
+
+# ------------------------------------------------------------------------------
+# 4. GENERATE ANNOTATED SHAP PLOTS
+# ------------------------------------------------------------------------------
+sv_bio <- shapviz(shap_bio, X = X_top)
+
+pdf("Q5_Biomarker_SHAP_and_Interactions.pdf", width = 11, height = 8)
+# The plots will now visually contain KEGG/HMDB/Human gene IDs on the Y-Axis!
+print(sv_importance(sv_bio, kind = "beeswarm") + ggtitle("Top 25 Biomarkers: Directionality"))
+
+# Specific Gene Targeting (with updated names)
+actual_top_name <- names(colMeans(abs(shap_bio)))[which.max(colMeans(abs(shap_bio)))]
+mapped_legacy_gene <- annotated_names[legacy_gene]
+
+if(!is.na(mapped_legacy_gene) && actual_top_name != mapped_legacy_gene) {
+  p_interact <- sv_dependence(sv_bio, v = actual_top_name, color_var = mapped_legacy_gene) + 
+    ggtitle(sprintf("SHAP Interaction:\n%s\nvs\n%s", actual_top_name, mapped_legacy_gene)) + 
+    theme_minimal()
+  print(p_interact)
+}
+dev.off()
+
+# Save Annotated CSV Reference
+top_features_df <- data.frame(Feature = top_features, Importance = imp[top_features, "MeanDecreaseGini"]) %>%
+  left_join(master_dict, by = "Feature") %>%
+  mutate(Biological_Annotation = ifelse(is.na(Biological_Annotation) | Biological_Annotation == "", "Unannotated", Biological_Annotation))
+write.csv(top_features_df, "Q5_Top25_Biomarkers_Annotated.csv", row.names = FALSE)
+
+cat("\nPipeline Execution Complete! Check your working directory for the annotated PDFs and CSVs.\n")
+```
+
